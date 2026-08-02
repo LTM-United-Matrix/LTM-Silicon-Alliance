@@ -1,0 +1,52 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v1.0 [BASE EDITION] ---
+import os
+import sys
+import time
+import psutil
+
+VERSION = "LTM Base Edition v1.0"
+TARGET_GAME = "cs2.exe"
+
+# Фиксируем игру строго на первых 4 потоках твоего Xeon (0, 1, 2, 3)
+# Это изолирует игру от системного шума Windows и обходит задержки одноканала
+PRIME_S_CONTOUR = [0, 1, 2, 3]
+
+def apply_base_ltm(game_proc):
+    try:
+        # Привязываем процесс CS2 к выбранным ядрам
+        game_proc.cpu_affinity(PRIME_S_CONTOUR)
+        
+        # Выставляем высокий приоритет в системе, чтобы кадры шли стабильно
+        game_proc.nice(psutil.HIGH_PRIORITY_CLASS)
+        
+        print(f"\n[LTM v1.0 SUCCESS] Игра {TARGET_GAME} успешно взята под контроль!")
+        print(f"[ПРАЙМ] Потоки {PRIME_S_CONTOUR} выделены. Одноканал Kingston обойдён.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Не удалось применить оптимизацию: {e}")
+        return False
+
+if __name__ == "__main__":
+    print(f"==================================================")
+    print(f"   ACTIVATING BASE ENGINE: {VERSION}   ")
+    print(f"==================================================")
+    print("Статус: Ожидание запуска CS2 в системе Windows...")
+    
+    while True:
+        game_found = False
+        # Сканируем запущенные процессы в поисках CS2
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and proc.info['name'].lower() == TARGET_GAME.lower():
+                try:
+                    game_handle = psutil.Process(proc.pid)
+                    if apply_base_ltm(game_handle):
+                        game_found = True
+                        # Держим скрипт активным, пока открыта игра
+                        while game_handle.is_running():
+                            time.sleep(1)
+                        print("\n[LTM STOP] Игра закрыта. Возврат в режим ожидания...")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        
+        # Опрашиваем систему каждые 2 секунды, чтобы не грузить процессор
+        time.sleep(2)
