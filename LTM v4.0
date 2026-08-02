@@ -1,0 +1,90 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v4.0 [SMOOTH BUFFER] ---
+import os
+import sys
+import time
+import ctypes
+import psutil
+
+VERSION = "LTM Base v4.0 (Smooth Buffer)"
+
+# --- МАТРИЦА СВЯЗИ ЯДЕР CPU ---
+PRIME_S_CONTOUR =        # Игровой Прайм (Потоки 0, 1, 2, 3)
+HELPER_P_CLUSTER = list(range(4, 24))  # Помощники "на чиле" (20 потоков)
+SPARE_RESERVE =      # ЗАПАСНОЙ ЦЫПЛЁНОК (Потоки 24, 25, 26, 27)
+
+SYSTEM_BLACKLIST = {
+    "explorer.exe", "discord.exe", "chrome.exe", "browser.exe", "vk.exe",
+    "steam.exe", "telegram.exe", "python.exe", "cmd.exe", "taskmgr.exe",
+    "svchost.exe", "system", "idle", "aida64.exe", "vkmessenger.exe"
+}
+
+def clean_system_memory():
+    try: ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+    except: pass
+
+def find_active_game():
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            p_name = proc.info['name'].lower()
+            if p_name in SYSTEM_BLACKLIST or p_name.startswith("nvidia") or p_name.startswith("amd"):
+                continue
+            try:
+                p_handle = psutil.Process(proc.info['pid'])
+                if p_handle.num_threads() > 15 and not p_name.startswith("svchost"):
+                    return p_handle
+            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+    except: pass
+    return None
+
+def apply_v4_ltm(game_proc):
+    try:
+        clean_system_memory()
+        game_proc.cpu_affinity(PRIME_S_CONTOUR)
+        game_proc.nice(psutil.HIGH_PRIORITY_CLASS)
+        print(f"\n[LTM v4.0 DETECTED] Буфер плавности активирован.")
+        return True
+    except: return False
+
+def monitor_v4_stability(game_proc):
+    """ФИШКА v4.0: Удержание цыплёнка в буфере на 2 секунды для ровного FPS"""
+    print(f"[LTM MONITOR] Слежение за плавностью активно.")
+    in_overdrive = False
+    cooldown_until = 0.0
+    
+    while game_proc.is_running():
+        cpu_loads = psutil.cpu_percent(interval=0.05, percpu=True)
+        if not cpu_loads or len(cpu_loads) < 24: continue
+        
+        helpers_avg = sum([cpu_loads[i] for i in HELPER_P_CLUSTER]) / len(HELPER_P_CLUSTER)
+        current_time = time.time()
+        
+        # Если пошёл замес, включаем резерв и ставим таймер удержания на 2 секунды наперёд
+        if helpers_avg > 75.0:
+            cooldown_until = current_time + 2.0
+            if not in_overdrive:
+                game_proc.cpu_affinity(PRIME_S_CONTOUR + SPARE_RESERVE)
+                in_overdrive = True
+                print("[SMOOTH OVERDRIVE] Жесткая сцена! Подключен цыплёнок с защитой графика.")
+        
+        # Плавный выход из овердрайва только тогда, когда время буфера истекло
+        elif in_overdrive and current_time > cooldown_until:
+            game_proc.cpu_affinity(PRIME_S_CONTOUR)
+            in_overdrive = False
+            print("[SMOOTH CHILL] Замес окончен. Резерв плавно отключен, Zeonчик остывает.")
+            
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    print(f"==================================================")
+    print(f"   LAUNCHING ENGINE: {VERSION}   ")
+    print(f"==================================================")
+    print("Статус: Ожидание запуска игры...")
+    
+    while True:
+        detected_game = find_active_game()
+        if detected_game:
+            if apply_v4_ltm(detected_game):
+                monitor_v4_stability(detected_game)
+                print("\n[LTM STOP] Игра закрыта.")
+                time.sleep(3)
+        time.sleep(2)
