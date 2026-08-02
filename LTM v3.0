@@ -1,0 +1,83 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v3.0 [SPARE CHICKEN v1] ---
+import os
+import sys
+import time
+import ctypes
+import psutil
+
+VERSION = "LTM Base v3.0 (Spare Chicken v1)"
+
+# --- МАТРИЦА СВЯЗИ ЯДЕР CPU ---
+PRIME_S_CONTOUR =        # Игровой Прайм (Потоки 0, 1, 2, 3)
+HELPER_P_CLUSTER = list(range(4, 24))  # Помощники "на чиле" (20 потоков)
+SPARE_RESERVE =      # ЗАПАСНОЙ ЦЫПЛЁНОК (Потоки 24, 25, 26, 27)
+
+SYSTEM_BLACKLIST = {
+    "explorer.exe", "discord.exe", "chrome.exe", "browser.exe", "vk.exe",
+    "steam.exe", "telegram.exe", "python.exe", "cmd.exe", "taskmgr.exe",
+    "svchost.exe", "system", "idle", "aida64.exe", "vkmessenger.exe"
+}
+
+def clean_system_memory():
+    try: ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+    except: pass
+
+def find_active_game():
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            p_name = proc.info['name'].lower()
+            if p_name in SYSTEM_BLACKLIST or p_name.startswith("nvidia") or p_name.startswith("amd"):
+                continue
+            try:
+                p_handle = psutil.Process(proc.info['pid'])
+                if p_handle.num_threads() > 15 and not p_name.startswith("svchost"):
+                    return p_handle
+            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+    except: pass
+    return None
+
+def apply_v3_ltm(game_proc):
+    try:
+        clean_system_memory()
+        game_proc.cpu_affinity(PRIME_S_CONTOUR)
+        game_proc.nice(psutil.HIGH_PRIORITY_CLASS)
+        print(f"\n[LTM v3.0 DETECTED] Игра успешно запущена под контролем Прайма.")
+        return True
+    except: return False
+
+def monitor_v3_stability(game_proc):
+    """ФИШКА v3.0: Первое слежение за нагрузкой и активация резервного цыплёнка"""
+    print(f"[LTM MONITOR] Слежение за стабильностью запущено.")
+    
+    while game_proc.is_running():
+        # Быстрый замер нагрузки на потоки
+        cpu_loads = psutil.cpu_percent(interval=0.1, percpu=True)
+        if not cpu_loads or len(cpu_loads) < 24: continue
+        
+        # Считаем среднюю нагрузку на ядра-помощники
+        helpers_avg = sum([cpu_loads[i] for i in HELPER_P_CLUSTER]) / len(HELPER_P_CLUSTER)
+        
+        # Если пошёл жесткий замес (нагрузка > 75%), мгновенно бросаем резерв в бой!
+        if helpers_avg > 75.0:
+            game_proc.cpu_affinity(PRIME_S_CONTOUR + SPARE_RESERVE)
+            print("[BURST] Резкий скачок нагрузки! ЗАПАСНОЙ ЦЫПЛЁНОК подключен для удержания FPS!")
+        else:
+            # Возвращаем игру на чистый Прайм, когда всё спокойно
+            game_proc.cpu_affinity(PRIME_S_CONTOUR)
+            
+        time.sleep(0.1)
+
+if __name__ == "__main__":
+    print(f"==================================================")
+    print(f"   LAUNCHING ENGINE: {VERSION}   ")
+    print(f"==================================================")
+    print("Статус: Ожидание запуска игры...")
+    
+    while True:
+        detected_game = find_active_game()
+        if detected_game:
+            if apply_v3_ltm(detected_game):
+                monitor_v3_stability(detected_game)
+                print("\n[LTM STOP] Игра закрыта. Резерв уходит спать...")
+                time.sleep(3)
+        time.sleep(2)
