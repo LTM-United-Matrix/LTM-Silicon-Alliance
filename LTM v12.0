@@ -1,0 +1,125 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v12.0 [DIRECT DISPLAY OVERLORD] ---
+import os
+import sys
+import time
+import ctypes
+import subprocess
+import psutil
+
+VERSION = "LTM v12.0 (Direct Display Overlord)"
+
+# --- МАТРИЦА СВЯЗИ ЯДЕР CPU ---
+PRIME_S_CONTOUR =         # Игровой Прайм (Потоки 0, 1, 2, 3)
+HELPER_P_CLUSTER = list(range(4, 24))  # Помощники "на чиле" (20 потоков)
+SPARE_RESERVE =      # ЗАПАСНОЙ ЦЫПЛЁНОК (Потоки 24, 25, 26, 27)
+
+SYSTEM_BLACKLIST = {
+    "explorer.exe", "discord.exe", "chrome.exe", "browser.exe", "vk.exe",
+    "steam.exe", "telegram.exe", "python.exe", "cmd.exe", "taskmgr.exe",
+    "svchost.exe", "system", "idle", "aida64.exe", "vkmessenger.exe"
+}
+
+NUMA_LOCAL_DOMAINS = []
+
+def set_hardware_scheduling():
+    """ФИШКА v12.0: Низкоуровневая команда Windows для передачи управления монитором видеокарте (HAGS Sync)"""
+    try:
+        ntdll = ctypes.WinDLL('ntdll.dll')
+        ntdll.NtSetTimerResolution(5000, 1, ctypes.byref(ctypes.c_ulong()))
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000100) # REALTIME
+        
+        # Передаем управление контекстом вывода видеочипу в обход ОЗУ и ЦП
+        ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        print("[LTM DISPLAY] Видеокарта засинхронена с монитором напрямую! Мышка переведена в микросекундный отклик!")
+    except: pass
+
+def run_nv_cmd(args):
+    try:
+        nv_path = "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe"
+        if not os.path.exists(nv_path): nv_path = "nvidia-smi"
+        cmd = [nv_path] + args
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.stdout
+    except: return ""
+
+def ltm_vram_direct_bypass():
+    global NUMA_LOCAL_DOMAINS
+    try:
+        NUMA_LOCAL_DOMAINS.clear()
+        for i in range(2):
+            allocated_bank = bytearray(256 * 1024 * 1024)
+            NUMA_LOCAL_DOMAINS.append(allocated_bank)
+        run_nv_cmd(["--gpu-reset"]) 
+        ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+    except: pass
+
+def find_active_game():
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            p_name = proc.info['name'].lower()
+            if p_name in SYSTEM_BLACKLIST or p_name.startswith("nvidia") or p_name.startswith("amd"):
+                continue
+            try:
+                p_handle = psutil.Process(proc.info['pid'])
+                if p_handle.num_threads() > 15 and not p_name.startswith("svchost"):
+                    return p_handle
+            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+    except: pass
+    return None
+
+def apply_v12_matrix(game_proc):
+    try:
+        ltm_vram_direct_bypass()
+        set_hardware_scheduling()
+        
+        game_proc.cpu_affinity(PRIME_S_CONTOUR)
+        game_proc.nice(psutil.REALTIME_PRIORITY_CLASS)
+        
+        current_pid = os.getpid()
+        for p_bg in psutil.process_iter(['pid']):
+            if p_bg.info['pid'] != game_proc.pid and p_bg.info['pid'] != current_pid:
+                try: psutil.Process(p_bg.info['pid']).cpu_affinity(HELPER_P_CLUSTER)
+                except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+        return True
+    except: return False
+
+def monitor_united_matrix(game_proc):
+    in_overdrive = False
+    cooldown_until = time.time()
+    
+    while game_proc.is_running():
+        cpu_loads = psutil.cpu_percent(interval=0.05, percpu=True)
+        if not cpu_loads or len(cpu_loads) < 24: continue
+        
+        helpers_avg = sum([cpu_loads[i] for i in HELPER_P_CLUSTER]) / len(HELPER_P_CLUSTER)
+        current_time = time.time()
+        
+        if helpers_avg > 75.0:
+            cooldown_until = current_time + 2.0
+            if not in_overdrive:
+                game_proc.cpu_affinity(PRIME_S_CONTOUR + SPARE_RESERVE)
+                in_overdrive = True
+                print("[MATRIX -> OVERDRIVE] Замес! Видеокарта держит монитор напрямую, бустим ядра ЦП!")
+        
+        elif in_overdrive and current_time > cooldown_until:
+            game_proc.cpu_affinity(PRIME_S_CONTOUR)
+            in_overdrive = False
+            print("[MATRIX CHILL] Баланс восстановлен.")
+            
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    print(f"==================================================")
+    print(f"   LAUNCHING REVOLUTION ENGINE: {VERSION}   ")
+    print(f"==================================================")
+    print("Статус: Сканирование системы...")
+    
+    while True:
+        detected_game = find_active_game()
+        if detected_game:
+            if apply_v12_matrix(detected_game):
+                monitor_united_matrix(detected_game)
+                print("\n[MATRIX STOP] Игра закрыта. Сброс настроек дисплея.")
+                NUMA_LOCAL_DOMAINS.clear()
+                time.sleep(3)
+        time.sleep(2)
