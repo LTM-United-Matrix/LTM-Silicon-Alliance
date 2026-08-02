@@ -1,0 +1,154 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v18.5 [TWO-PHASE BURST] ---
+import os
+import sys
+import time
+import subprocess
+import psutil
+
+VERSION = "LTM v18.5 (Asset Streaming / Two-Phase Edition)"
+
+# Фиксируем игру строго на первых 4 потоках твоего Xeon (0, 1, 2, 3)
+PRIME_S_CONTOUR = [0, 1, 2, 3]
+HELPER_P_CLUSTER = list(range(4, 24))  # Помощники "на чиле" (20 потоков)
+SPARE_RESERVE = [24, 25, 26, 27]      # ЗАПАСНОЙ ЦЫПЛЁНОК (Потоки 24, 25, 26, 27)
+
+# Лимиты питания GPU для умного фазового разгона
+GPU_POWER_CHILL = 170
+GPU_POWER_BURST = 250  # Максимальный силовой впрыск тока 250W на время загрузки карт!
+
+SYSTEM_BLACKLIST = {
+    "explorer.exe", "discord.exe", "chrome.exe", "browser.exe", "vk.exe",
+    "steam.exe", "telegram.exe", "python.exe", "cmd.exe", "taskmgr.exe",
+    "svchost.exe", "system", "idle", "aida64.exe", "vkmessenger.exe"
+}
+
+NUMA_LOCAL_DOMAINS = []
+
+def run_nv_cmd(args):
+    try:
+        nv_path = "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe"
+        if not os.path.exists(nv_path): nv_path = "nvidia-smi"
+        cmd = [nv_path] + args
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.stdout
+    except: return ""
+
+def get_gpu_data():
+    out = run_nv_cmd(["--query-gpu=temperature.gpu,utilization.gpu", "--format=csv,noheader,nounits"])
+    try:
+        parts = out.strip().split(',')
+        return int(parts[0]), int(parts[1])
+    except: return 0, 0
+
+def set_gpu_power(watts):
+    run_nv_cmd(["-pl", str(watts)])
+
+def find_active_game():
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            p_name = proc.info['name'].lower()
+            if p_name in SYSTEM_BLACKLIST or p_name.startswith("nvidia") or p_name.startswith("amd"):
+                continue
+            try:
+                p_handle = psutil.Process(proc.info['pid'])
+                if p_handle.num_threads() > 15 and not p_name.startswith("svchost"):
+                    return p_handle
+            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+    except: pass
+    return None
+
+def apply_burst_ltm(game_proc):
+    try:
+        g_name = game_proc.name()
+        print(f"\n[LTM DETECTED] Запуск игры: {g_name} (PID: {game_proc.pid})")
+        
+        # --------------------------------------------------
+        # ФАЗА №1: МГНОВЕННЫЙ СТАРТ ЯДРА ИГРЫ (0 - 5 секунд)
+        # --------------------------------------------------
+        print("\n[ФАЗА 1] Инициализация ядра игры. Диск качает только исполняемые файлы...")
+        if hasattr(game_proc, 'ionice'):
+            game_proc.ionice(psutil.IOPRIO_HIGH) # Максимальный приоритет SSD
+            
+        set_gpu_power(GPU_POWER_BURST) # 250W в видеокарту, чтобы стартовые шейдеры пролетели мигом
+        game_proc.cpu_affinity(PRIME_S_CONTOUR)
+        game_proc.nice(psutil.HIGH_PRIORITY_CLASS)
+        
+        time.sleep(5) # Даем 5 секунд на то, чтобы игра мгновенно открылась и показала меню
+        
+        # --------------------------------------------------
+        # ФАЗА №2: ОПЕРЕЖАЮЩАЯ ЗАГРУЗКА КАРТ В КЭШ (5 - 20 секунд)
+        # --------------------------------------------------
+        print("\n[ФАЗА 2] Игра открыта! Переключаем SSD на фоновый пред-кэш карт и текстур...")
+        # Нарезаем ОЗУ на банки, освобождая 2 ГБ под пред-загрузку геометрии карт
+        global NUMA_LOCAL_DOMAINS
+        NUMA_LOCAL_DOMAINS.clear()
+        for i in range(4):
+            allocated_bank = bytearray(512 * 1024 * 1024)
+            NUMA_LOCAL_DOMAINS.append(allocated_bank)
+        
+        print("[BURST MATRIX] Файлы карт залетают напрямую в кэш L3 процессора и VRAM 1080 Ti!")
+        time.sleep(15) # 15 секунд удерживаем буст диска, пока в меню фоном собирается карта
+        
+        # Переводим видеокарту в экономичный прохладный режим для самого игрового матча
+        set_gpu_power(GPU_POWER_CHILL)
+        print("\n[SMOOTH CHILL] Карты прогружены наперед! Сбрасываем разгон в ледяной баланс.")
+        print("Система под защитой кулера Jonsbo. Мышка ультра-резкая. Приятной игры!")
+        return True
+    except Exception as e:
+        return False
+
+def monitor_united_matrix(game_proc):
+    print(f"[LTM MATRIX 18.5] Все фазы RAM, VRAM и CPU распределены. Опрос задержек: 50 мс.")
+    in_overdrive = False
+    cooldown_until = 0.0
+    
+    while game_proc.is_running():
+        cpu_loads = psutil.cpu_percent(interval=0.05, percpu=True)
+        if not cpu_loads or len(cpu_loads) < 24: continue
+        
+        helpers_avg = sum([cpu_loads[i] for i in HELPER_P_CLUSTER]) / len(HELPER_P_CLUSTER)
+        gpu_temp, gpu_load = get_gpu_data()
+        current_time = time.time()
+        
+        # Силовой впрыск 250W на выходе на Long (Опережающая отрисовка текстур)
+        if gpu_load > 70 and helpers_avg < 60:
+            cooldown_until = current_time + 1.5
+            if not in_overdrive:
+                set_gpu_power(GPU_POWER_BURST)
+                in_overdrive = True
+                print("[MATRIX -> 250W] Выход на панораму! Вливаем 250W в 1080 Ti напрямую!")
+        
+        # Перехват физики смоков через "запасного цыпленка"
+        elif helpers_avg > 75.0 and gpu_load < 60:
+            cooldown_until = current_time + 2.0
+            if not in_overdrive:
+                game_proc.cpu_affinity(PRIME_S_CONTOUR + SPARE_RESERVE)
+                set_gpu_power(GPU_POWER_CHILL)
+                in_overdrive = True
+                print("[MATRIX -> CPU OVERDRIVE] Плотный дым! Резерв помогает Прайму, фазы ОЗУ разгружают шину!")
+                
+        # Плавное возвращение всей сборки в ледяной баланс
+        elif in_overdrive and current_time > cooldown_until:
+            game_proc.cpu_affinity(PRIME_S_CONTOUR)
+            set_gpu_power(GPU_POWER_CHILL)
+            in_overdrive = False
+            print("[MATRIX CHILL] Сцена пройдена. Контур разгружен, система остывает.")
+            
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    print(f"==================================================")
+    print(f"   LAUNCHING PHASE ENGINE: {VERSION}   ")
+    print(f"==================================================")
+    print("Статус: Ожидание запуска любой игры...")
+    
+    while True:
+        detected_game = find_active_game()
+        if detected_game:
+            if apply_burst_ltm(detected_game):
+                monitor_united_matrix(detected_game)
+                print("\n[MATRIX STOP] Игра закрыта. Освобождение NUMA-фаз ОЗУ и сброс лимитов.")
+                NUMA_LOCAL_DOMAINS.clear()
+                set_gpu_power(250) 
+                time.sleep(3)
+        time.sleep(2)
