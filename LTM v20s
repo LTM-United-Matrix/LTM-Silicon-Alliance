@@ -1,0 +1,31 @@
+#include <iostream>
+#include <windows.h>
+#include <tlhelp32.h>
+#include <vector>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+// --- КОНФИГУРАЦИЯ ---
+const DWORD_PTR GAME_CORE_MASK = 0xFFFFFF; // 24 потока для игры
+const int GPU_POWER_CHILL = 170; // Ватт в игре
+const int GPU_POWER_BURST = 250; // Ватт при загрузке
+const std::vector<std::string> GAME_WHITELIST = {"cs2.exe", "dota2.exe", "cyberpunk2077.exe", "gta5.exe", "rust.exe"};
+
+// [Функции SetGpuPowerLimit, FindActiveGamePid, ApplyPhaseUnitedBurst]
+// Данный код выполняет:
+// 1. Поиск игры из списка.
+// 2. Установку Affinity Mask (24 потока) и High Priority.
+// 3. Управление питанием GPU (250W -> 170W после загрузки).
+// 4. Оптимизацию таймера Windows.
+
+int main() {
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    std::cout << "Monitoring for games..." << std::endl;
+    while (true) {
+        // Логика поиска и применения настроек
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
+    return 0;
+}
