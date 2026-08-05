@@ -1,0 +1,23 @@
+# --- SYSTEM ENGINE: MEMORY LOW TRICK (LTM) v2.0 [RAM CLEANER] ---
+import os, sys, time, ctypes, psutil
+
+# Настройки
+PRIME_S_CONTOUR = [0, 1, 2, 3]  # Привязка к первым 4 потокам (одноканал)
+SYSTEM_BLACKLIST = {"explorer.exe", "discord.exe", "chrome.exe", "steam.exe"}
+
+def apply_optimization(proc):
+    """Применяет настройки: высокий приоритет и привязка к ядрам"""
+    try:
+        proc.cpu_affinity(PRIME_S_CONTOUR)
+        proc.nice(psutil.HIGH_PRIORITY_CLASS)
+        # Очистка RAM через Windows API
+        ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        return True
+    except: return False
+
+if __name__ == "__main__":
+    print("LTM v2.0 Active: Waiting for game...")
+    while True:
+        # Упрощенный поиск игры (нужно добавить логику поиска процесса)
+        # ... (код поиска)
+        time.sleep(2)
