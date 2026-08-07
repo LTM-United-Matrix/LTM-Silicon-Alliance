@@ -1,0 +1,311 @@
+#pragma once
+#include <windows.h>
+#include <tlhelp32.h>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <psapi.h>
+
+#pragma comment(lib, "psapi.lib")
+
+// Низкоуровневые дефиниции для системного таймера ntdll.dll
+typedef NTSTATUS(NTAPI* pfnNtSetTimerResolution)(ULONG RequestedResolution, BOOLEAN SetResolution, PULONG ActualResolution);
+
+// Константы конфигурации под твое железо (Xeon E5-2680 + MSI Aero GTX 1080 Ti)
+const int GTX1080TI_BASE_PL = 250;
+const int GTX1080TI_OVERTIME_PL = 275;
+const DWORD_PTR SYSTEM_CORE_MASK = 0x0F;       // Потоки 0-3 под Windows и фоновый софт
+const DWORD_PTR GAME_CORE_MASK = 0xFFFFF0;     // Потоки 4-23 чистыми под игру
+
+struct GameProfile {
+    std::string name;
+    std::string mode;
+};
+
+// Из v21s: Изменение разрешения системного таймера Windows до пиковых 0.5 мс
+inline void SetMaxTimerResolution(bool enable) {
+    HMODULE hNtDll = GetModuleHandleA("ntdll.dll");
+    if (hNtDll) {
+        pfnNtSetTimerResolution NtSetTimerResolution = (pfnNtSetTimerResolution)GetProcAddress(hNtDll, "NtSetTimerResolution");
+        if (NtSetTimerResolution) {
+            ULONG actualResolution;
+            NtSetTimerResolution(enable ? 500000 : 10000000, enable, &actualResolution);
+        }
+    }
+}
+
+// Из v1/v11: Агрессивное сжатие Working Set оперативной памяти для фоновых задач
+inline void CleanSystemMemory() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe = { sizeof(PROCESSENTRY32) };
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID != 0 && pe.th32ProcessID != 4 && pe.th32ProcessID != GetCurrentProcessId()) {
+                HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    EmptyWorkingSet(hProcess);
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+}
+
+// Сетевой замок (Network Latency Lock) для отключения задержек пакетов
+inline void SetNetworkGamingTweak(DWORD value) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile", 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "NetworkThrottlingIndex", 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
+        RegCloseKey(hKey);
+    }
+}
+
+// Управление лимитами энергопотребления MSI Aero через утилиту драйвера
+inline void SetNvidiaPowerLimit(int wattage) {
+    if (std::system("where nvidia-smi > nul 2>&1") == 0) {
+        std::string cmd = "nvidia-smi -pl " + std::to_string(wattage) + " > nul 2>&1";
+        std::system(cmd.c_str());
+    }
+}
+
+// Изоляция фонового софта системы на первые 4 потока Xeon
+inline void RestrictBackgroundProcesses(DWORD gamePid) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe = { sizeof(PROCESSENTRY32) };
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID != gamePid && pe.th32ProcessID != 0 && pe.th32ProcessID != 4) {
+                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    SetProcessAffinityMask(hProcess, SYSTEM_CORE_MASK);
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+}
+
+// Возврат фонового софта на все 24 потока процессора
+inline void RestoreSystemProcesses() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe = { sizeof(PROCESSENTRY32) };
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID != 0 && pe.th32ProcessID != 4) {
+                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    SetProcessAffinityMask(hProcess, (DWORD_PTR)-1);
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+}
+
+// Логика чтения профилей из текстовой базы ltm_database.txt
+inline std::vector<GameProfile> LoadDatabase() {
+    std::vector<GameProfile> profiles;
+    std::ifstream file("ltm_database.txt");
+    if (!file) {
+        std::ofstream createDb("ltm_database.txt");
+        createDb << "cs2.exe esports\ncsgo.exe esports\ndota2.exe esports\ncyberpunk2077.exe casual\n";
+        createDb.close();
+        profiles.push_back({"cs2.exe", "esports"});
+        profiles.push_back({"csgo.exe", "esports"});
+        profiles.push_back({"dota2.exe", "esports"});
+        profiles.push_back({"cyberpunk2077.exe", "casual"});
+        return profiles;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+        std::string name, mode;
+        if (ss >> name >> mode) profiles.push_back({name, mode});
+    }
+    return file.close(), profiles;
+}
+
+// Поиск запущенного процесса игры из базы данных
+inline DWORD FindActiveGamePid(const std::vector<GameProfile>& db, std::string& foundName, std::string& foundMode) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 pe = { sizeof(PROCESSENTRY32) };
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            std::string procName(pe.szExeFile);
+            std::transform(procName.begin(), procName.end(), procName.begin(), ::tolower);
+            for (const auto& game : db) {
+                std::string target = game.name;
+                std::transform(target.begin(), target.end(), target.begin(), ::tolower);
+                if (procName == target) {
+                    foundName = game.name;
+                    foundMode = game.mode;
+                    CloseHandle(hSnapshot);
+                    return pe.th32ProcessID;
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+    return 0;
+}
+#include "ltm_engine.h"
+#include <iostream>
+
+// Переменные контроля глобального состояния
+bool isOvertimeActive = false;
+bool isTransitioning = false;
+auto overtimeStartTime = std::chrono::steady_clock::now();
+std::string globalActiveGame = "НЕТ (Ожидание...)";
+std::string globalActiveMode = "---";
+std::string globalNetStatus = "[ОЖИДАНИЕ]";
+
+void ResetConsoleCursor() {
+    COORD coord = { 0, 0 };
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), coord);
+}
+
+void HideConsoleCursor() {
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cursorInfo);
+}
+
+// Из v21s: Активация 60-секундного Овертайма с бескомпромиссным REALTIME приоритетом
+void HandleOvertime(HANDLE gameHandle, const std::string& mode) {
+    if (mode != "esports") return;
+    if (!isOvertimeActive) {
+        isOvertimeActive = true;
+        overtimeStartTime = std::chrono::steady_clock::now();
+        
+        SetNvidiaPowerLimit(GTX1080TI_OVERTIME_PL);
+        SetPriorityClass(gameHandle, REALTIME_PRIORITY_CLASS); 
+    }
+    if (isOvertimeActive) {
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - overtimeStartTime).count();
+        if (elapsed >= 60) {
+            isOvertimeActive = false;
+            SetNvidiaPowerLimit(GTX1080TI_BASE_PL);
+            SetPriorityClass(gameHandle, HIGH_PRIORITY_CLASS); // Безопасный откат до Высокого
+        }
+    }
+}
+
+// Наша технология плавного выхода (Smooth Landing)
+void ExecuteSmoothLanding() {
+    isTransitioning = true;
+    globalActiveGame = "ВЫХОД (Стабилизация ресурсов...)";
+    
+    SetNetworkGamingTweak(0xFFFFFFFF); 
+    SetMaxTimerResolution(false); 
+    globalNetStatus = "[ОТКЛЮЧЕН]";
+
+    RestoreSystemProcesses();
+    
+    // Ступенчатый сброс питания для защиты VRM турбины MSI Aero
+    SetNvidiaPowerLimit(260);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    SetNvidiaPowerLimit(GTX1080TI_BASE_PL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    
+    isOvertimeActive = false;
+    isTransitioning = false;
+    globalActiveGame = "НЕТ (Ожидание...)";
+    globalActiveMode = "---";
+}
+
+// Отрисовка немерцающего ASCII интерфейса Cyber HUD
+void RenderCyberHUD() {
+    ResetConsoleCursor();
+    std::cout << "=====================================================================\n";
+    std::cout << "  [+] LTM v24 Overlord Maximum S // FINAL MONOLITH                   \n";
+    std::cout << "=====================================================================\n";
+    std::cout << "  [КОНФИГУРАЦИЯ СИСТЕМЫ]:\n";
+    std::cout << "  -> ЦП: Intel Xeon E5-2680 (Разделение: ОС 0-3 ядра / Игра 4-23 ядра) \n";
+    std::cout << "  -> ГП: MSI Aero GTX 1080 Ti (Базовый лимит: " << GTX1080TI_BASE_PL << "W)\n";
+    std::cout << "  -> Таймер ОС NTDLL:   [0.5ms MAX RESOLUTION ACTIVE]                \n";
+    std::cout << "---------------------------------------------------------------------\n";
+    std::cout << "  [ТЕКУЩИЙ СТАТУС ОПТИМИЗАЦИИ] (Цикл проверки: 1 сек):\n";
+    std::cout << "  -> Активный процесс:  " << globalActiveGame << "\n";
+    std::cout << "  -> Профиль настроек:  " << globalActiveMode << "\n";
+    std::cout << "  -> Сетевой замок:     " << globalNetStatus << "\n";
+    std::cout << "  -> Энергопакет ГП:    ";
+    if (isTransitioning) {
+        std::cout << "[SMOOTH LANDING] -> Снижение частот...               \n";
+    } else if (isOvertimeActive) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - overtimeStartTime).count();
+        std::cout << "[OVERTIME REALTIME] -> " << GTX1080TI_OVERTIME_PL << "W (" << elapsed << "s/60s)\n";
+    } else {
+        std::cout << "[STANDBY MODE]    -> " << GTX1080TI_BASE_PL << "W\n";
+    }
+    std::cout << "=====================================================================\n";
+}
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+    std::system("cls");
+    HideConsoleCursor();
+    SetWindowTextA(GetConsoleWindow(), "LTM v24 Overlord Maximum S");
+
+    std::vector<GameProfile> db = LoadDatabase();
+    bool gameWasRunning = false;
+    DWORD targetPid = 0;
+
+    while (true) {
+        std::string foundName = "";
+        std::string foundMode = "";
+        targetPid = FindActiveGamePid(db, foundName, foundMode);
+
+        if (targetPid != 0) {
+            if (!gameWasRunning) {
+                gameWasRunning = true;
+                globalActiveGame = foundName;
+                globalActiveMode = foundMode;
+                
+                // Наследие старых версий: Выбиваем фоновые кэши из ОЗУ и зажимаем таймер Windows
+                CleanSystemMemory();
+                SetMaxTimerResolution(true);
+
+                if (foundMode == "esports") {
+                    SetNetworkGamingTweak(0); 
+                    globalNetStatus = "[АКТИВЕН (Пинг: MIN)]";
+                } else {
+                    globalNetStatus = "[ОБЫЧНЫЙ (Casual)]";
+                }
+
+                HANDLE gameHandle = OpenProcess(PROCESS_SET_INFORMATION, FALSE, targetPid);
+                if (gameHandle) {
+                    SetProcessAffinityMask(gameHandle, GAME_CORE_MASK);
+                    RestrictBackgroundProcesses(targetPid);
+                    CloseHandle(gameHandle);
+                }
+            }
+            
+            HANDLE gameHandle = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, targetPid);
+            if (gameHandle) {
+                HandleOvertime(gameHandle, foundMode);
+                CloseHandle(gameHandle);
+            }
+        } 
+        else if (targetPid == 0 && gameWasRunning) {
+            gameWasRunning = false;
+            ExecuteSmoothLanding();
+        }
+
+        RenderCyberHUD();
+        std::this_thread::sleep_for(std::chrono::seconds(1)); // Пробуждение строго раз в 1 секунду
+    }
+    return 0;
+}
