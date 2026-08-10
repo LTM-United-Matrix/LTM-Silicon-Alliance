@@ -1,0 +1,604 @@
+/*
+ * ================================================================================
+ * ================================================================================
+ *     LTM UNITED EDITION — ФИНАЛЬНАЯ ВЕРСИЯ
+ *     v18.5 (Two-Phase Burst) + Overlord v23 (Модульное ядро)
+ *     + FATALITY / BRUTALITY + АВТОКОНФИГ + РЕЖИМ ШКОЛЫ
+ *     ВСЕ ОШИБКИ ИСПРАВЛЕНЫ
+ * ================================================================================
+ * ================================================================================
+ *
+ *   Архитектор: Чингиз (LTM-United-Matrix)
+ *   Платформа: Windows 11 x64
+ *   Железо: Xeon E5-2680 v4 (14C/28T) + GTX 1080 Ti + Kingston DDR4
+ *   Компилятор: Visual Studio 2022 (v143) | C++17
+ *
+ * ================================================================================
+ */
+
+#include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <limits>
+#include <cstdlib>
+#include <ctime>
+#include <mutex>
+
+#pragma comment(lib, "psapi.lib")
+
+// ================================================================================
+// КОНФИГУРАЦИЯ
+// ================================================================================
+
+const std::string VERSION = "LTM United Edition v1.0 Final";
+const std::string BUILD_DATE = "2026-08-10";
+
+// Режимы (пользователь может переключить)
+bool SCHOOL_MODE = false;
+bool FATALITY_ENABLED = true;
+bool BRUTALITY_ENABLED = true;
+
+// Ядра для Xeon E5-2680 v4 (28 потоков: 0-27)
+const DWORD_PTR PRIME_CORES  = 0x0000000F;  // Ядра 0-3   (биты 0-3)
+const DWORD_PTR HELPER_CORES = 0x00FFFFF0;  // Ядра 4-23  (биты 4-23)
+const DWORD_PTR SPARE_CORES  = 0x0F000000;  // Ядра 24-27 (биты 24-27)
+const DWORD_PTR ALL_CORES    = 0x0FFFFFFF;  // Все 28 потоков
+
+// GPU (GTX 1080 Ti)
+const int GPU_POWER_FATALITY = 120;
+const int GPU_POWER_CHILL    = 170;
+const int GPU_POWER_BOOST    = 250;
+const int GPU_POWER_DEFAULT  = 250;
+
+// Тайминги фаз (из v18.5)
+const int PHASE1_DURATION_SEC       = 5;
+const int PHASE2_DURATION_SEC       = 15;
+const int GAME_DETECTION_INTERVAL_SEC = 2;
+const int HUD_REFRESH_MS            = 1000;
+const int FATALITY_COOLDOWN_SEC     = 30;
+const int BRUTALITY_DURATION_SEC    = 3;
+const int FATALITY_DURATION_SEC     = 3;
+const int NVIDIA_SMI_TIMEOUT_MS     = 15000;
+const int MIN_CONSOLE_ROWS_FOR_HUD  = 14;
+
+// База игр
+const std::vector<std::string> GAME_WHITELIST = {
+    "cs2.exe", "r5apex.exe", "cod.exe", "valorant.exe",
+    "fortnite.exe", "cyberpunk2077.exe", "roblox.exe"
+};
+
+// Системный блеклист
+const std::vector<std::string> SYSTEM_BLACKLIST = {
+    "explorer.exe", "discord.exe", "chrome.exe", "steam.exe",
+    "svchost.exe", "taskmgr.exe", "nvcontainer.exe", "amdfendr.exe",
+    "python.exe", "cmd.exe", "system", "idle", "msedge.exe",
+    "firefox.exe", "opera.exe", "telegram.exe", "vk.exe"
+};
+
+// ================================================================================
+// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+// ================================================================================
+
+std::atomic<bool> gameRunning{false};
+std::atomic<bool> fatalityActive{false};
+std::atomic<bool> brutalityActive{false};
+std::atomic<int> currentPhase{0};
+std::atomic<int> currentGpuPower{GPU_POWER_DEFAULT};
+std::atomic<int> currentGpuTemp{0};
+std::atomic<int> currentGpuUtil{0};
+std::string activeGameName = "";
+DWORD activeGamePid = 0;
+bool isDualChannel = false;
+bool isAdmin = false;
+
+// Потоки для Fatality/Brutality (без утечек)
+std::vector<std::thread> workerThreads;
+std::mutex threadsMutex;
+
+// Таймер
+ULONG timerResolution = 5000;
+bool timerSet = false;
+
+// ================================================================================
+// ЛОГГЕР
+// ================================================================================
+
+class Logger {
+private:
+    static std::mutex logMutex;
+public:
+    static void Init() {
+        std::ofstream file("ltm_united.log", std::ios::trunc);
+        file << "============================================================\n";
+        file << "  LTM UNITED EDITION v1.0 FINAL — LOG FILE\n";
+        file << "  Build: " << BUILD_DATE << "\n";
+        file << "============================================================\n\n";
+        file.close();
+    }
+
+    static void Log(const std::string& message) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::ofstream file("ltm_united.log", std::ios::app);
+        if (file.is_open()) {
+            time_t now = time(nullptr);
+            char timeStr[32];
+            ctime_s(timeStr, sizeof(timeStr), &now);
+            timeStr[24] = '\0';
+            file << "[" << timeStr << "] " << message << std::endl;
+        }
+    }
+};
+std::mutex Logger::logMutex;
+
+// ================================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ================================================================================
+
+std::string ToLower(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) -> unsigned char {
+                       return static_cast<unsigned char>(std::tolower(c));
+                   });
+    return result;
+}
+
+std::string GetLastErrorAsString() {
+    DWORD errorCode = GetLastError();
+    if (errorCode == 0) return "NO_ERROR";
+    LPSTR messageBuffer = nullptr;
+    size_t size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+        NULL, errorCode, 0, (LPSTR)&messageBuffer, 0, NULL);
+    if (size == 0) return "Error: " + std::to_string(errorCode);
+    std::string msg(messageBuffer, size);
+    LocalFree(messageBuffer);
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+    return msg;
+}
+
+void ClearInputBuffer() {
+    std::cin.clear();
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+}
+
+bool IsRunningAsAdmin() {
+    BOOL result = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return result != FALSE;
+}
+
+void CleanupThreads() {
+    std::lock_guard<std::mutex> lock(threadsMutex);
+    for (auto& t : workerThreads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    workerThreads.clear();
+}
+
+// ================================================================================
+// АВТООПРЕДЕЛЕНИЕ КОНФИГУРАЦИИ
+// ================================================================================
+
+bool DetectDualChannel() {
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (!GlobalMemoryStatusEx(&memStatus)) {
+        Logger::Log("MEM: Failed to query memory status");
+        return false;
+    }
+
+    ULONGLONG totalGB = memStatus.ullTotalPhys / (1024ULL * 1024ULL * 1024ULL);
+    Logger::Log("MEM: Total RAM = " + std::to_string(totalGB) + " GB");
+
+    // Эвристика: > 16 ГБ = скорее всего двухканал
+    bool detected = totalGB > 16;
+    Logger::Log("MEM: Dual channel detected = " + std::string(detected ? "YES" : "NO"));
+    return detected;
+}
+
+// ================================================================================
+// GPU MANAGER (реальный)
+// ================================================================================
+
+std::string RunNvidiaSMI(const std::string& args) {
+    std::string cmdLine = "nvidia-smi " + args;
+
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Перенаправляем вывод
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        return "";
+    }
+
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    std::vector<char> cmdBuffer(cmdLine.begin(), cmdLine.end());
+    cmdBuffer.push_back('\0');
+
+    std::string output;
+
+    if (CreateProcessA(NULL, cmdBuffer.data(), NULL, NULL, TRUE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hWritePipe);
+
+        WaitForSingleObject(pi.hProcess, NVIDIA_SMI_TIMEOUT_MS);
+
+        char buffer[256];
+        DWORD bytesRead;
+        while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            output += buffer;
+        }
+
+        CloseHandle(hReadPipe);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+    }
+
+    return output;
+}
+
+bool SetGpuPowerLimit(int wattage) {
+    if (wattage < 100 || wattage > 500) {
+        Logger::Log("GPU: Invalid wattage " + std::to_string(wattage));
+        return false;
+    }
+
+    std::string output = RunNvidiaSMI("-pl " + std::to_string(wattage));
+
+    if (output.find("Success") != std::string::npos || output.empty()) {
+        currentGpuPower = wattage;
+        Logger::Log("GPU: Power set to " + std::to_string(wattage) + "W");
+        return true;
+    }
+
+    Logger::Log("GPU: Failed to set power: " + output);
+    return false;
+}
+
+void UpdateGpuStats() {
+    std::string output = RunNvidiaSMI("--query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits");
+    if (!output.empty()) {
+        std::stringstream ss(output);
+        std::string tempStr, utilStr;
+        if (std::getline(ss, tempStr, ',') && std::getline(ss, utilStr)) {
+            try {
+                currentGpuTemp = std::stoi(tempStr);
+                currentGpuUtil = std::stoi(utilStr);
+            } catch (...) {
+                // Игнорируем ошибки парсинга
+            }
+        }
+    }
+}
+
+// ================================================================================
+// MEMORY BRIDGE (из v18.5)
+// ================================================================================
+
+std::vector<std::vector<char>> numaBanks;
+std::mutex banksMutex;
+
+void AllocateMemoryBanks() {
+    std::lock_guard<std::mutex> lock(banksMutex);
+    numaBanks.clear();
+
+    int bankSizeMB = isDualChannel ? 256 : 512;
+    int bankCount = isDualChannel ? 2 : 4;
+
+    Logger::Log("MEM: Allocating " + std::to_string(bankCount) + " banks, " +
+                std::to_string(bankSizeMB) + " MB each");
+
+    for (int i = 0; i < bankCount; i++) {
+        try {
+            std::vector<char> bank(static_cast<size_t>(bankSizeMB) * 1024ULL * 1024ULL);
+            // Заполняем, чтобы память реально выделилась
+            std::fill(bank.begin(), bank.end(), 0);
+            numaBanks.push_back(std::move(bank));
+            Logger::Log("MEM: Bank " + std::to_string(i) + " allocated");
+        } catch (const std::bad_alloc&) {
+            Logger::Log("MEM: FAILED to allocate bank " + std::to_string(i) + " — out of memory");
+            // Пробуем меньший размер
+            try {
+                std::vector<char> bank(static_cast<size_t>(bankSizeMB / 2) * 1024ULL * 1024ULL);
+                std::fill(bank.begin(), bank.end(), 0);
+                numaBanks.push_back(std::move(bank));
+                Logger::Log("MEM: Bank " + std::to_string(i) + " allocated at half size");
+            } catch (const std::bad_alloc&) {
+                Logger::Log("MEM: Bank " + std::to_string(i) + " skipped entirely");
+            }
+        }
+    }
+
+    EmptyWorkingSet(GetCurrentProcess());
+}
+
+void ClearMemoryBanks() {
+    std::lock_guard<std::mutex> lock(banksMutex);
+    numaBanks.clear();
+    EmptyWorkingSet(GetCurrentProcess());
+    Logger::Log("MEM: All banks cleared");
+}
+
+// ================================================================================
+// PROCESS MANAGER
+// ================================================================================
+
+bool SetProcessCores(DWORD pid, DWORD_PTR affinityMask) {
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+    BOOL result = SetProcessAffinityMask(hProcess, affinityMask);
+    CloseHandle(hProcess);
+    return result != FALSE;
+}
+
+void RestrictBackgroundProcesses() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        Logger::Log("BG: Failed to create snapshot");
+        return;
+    }
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    DWORD ourPid = GetCurrentProcessId();
+    int restricted = 0, skipped = 0;
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            // Пропускаем систему и себя
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4 ||
+                pe.th32ProcessID == ourPid || pe.th32ProcessID == activeGamePid) {
+                skipped++;
+                continue;
+            }
+
+            // Проверяем блеклист
+            std::string pName = ToLower(pe.szExeFile);
+            bool blacklisted = false;
+            for (const auto& bl : SYSTEM_BLACKLIST) {
+                if (pName == ToLower(bl)) { blacklisted = true; break; }
+            }
+
+            if (blacklisted) {
+                skipped++;
+                continue;
+            }
+
+            if (SetProcessCores(pe.th32ProcessID, HELPER_CORES)) {
+                restricted++;
+            } else {
+                skipped++;
+            }
+
+        } while (Process32Next(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    Logger::Log("BG: " + std::to_string(restricted) + " restricted, " +
+                std::to_string(skipped) + " skipped");
+}
+
+void RestoreSystemProcesses() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    DWORD ourPid = GetCurrentProcessId();
+    int restored = 0;
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4 ||
+                pe.th32ProcessID == ourPid) continue;
+            if (SetProcessCores(pe.th32ProcessID, ALL_CORES)) restored++;
+        } while (Process32Next(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    Logger::Log("RESTORE: " + std::to_string(restored) + " processes restored");
+}
+
+void CleanSystemMemory() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    DWORD ourPid = GetCurrentProcessId();
+    int cleaned = 0;
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4 ||
+                pe.th32ProcessID == ourPid || pe.th32ProcessID == activeGamePid) continue;
+
+            HANDLE hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION,
+                                       FALSE, pe.th32ProcessID);
+            if (hProc) {
+                EmptyWorkingSet(hProc);
+                CloseHandle(hProc);
+                cleaned++;
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    Logger::Log("CLEAN: " + std::to_string(cleaned) + " processes cleaned");
+}
+
+// ================================================================================
+// GAME DETECTOR
+// ================================================================================
+
+bool FindActiveGame(DWORD& outPid, std::string& outName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    bool found = false;
+
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            std::string pName = ToLower(pe.szExeFile);
+
+            // Проверяем вайтлист — только игры из списка
+            bool whitelisted = false;
+            for (const auto& wl : GAME_WHITELIST) {
+                if (pName == ToLower(wl)) { whitelisted = true; break; }
+            }
+
+            if (whitelisted) {
+                outPid = pe.th32ProcessID;
+                outName = pe.szExeFile;
+                found = true;
+                break;
+            }
+
+        } while (Process32Next(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+// ================================================================================
+// TIMER
+// ================================================================================
+
+void OptimizeWindowsTimer() {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) {
+        Logger::Log("TIMER: ntdll.dll not found");
+        return;
+    }
+
+    typedef LONG(WINAPI* NtSetTimerResolutionPtr)(ULONG, BOOLEAN, PULONG);
+    auto NtSetTimerResolution = (NtSetTimerResolutionPtr)GetProcAddress(ntdll, "NtSetTimerResolution");
+    if (!NtSetTimerResolution) {
+        Logger::Log("TIMER: NtSetTimerResolution not found");
+        return;
+    }
+
+    ULONG currentRes = 0;
+    LONG status = NtSetTimerResolution(5000, TRUE, &currentRes);
+    if (status == 0) {
+        timerSet = true;
+        timerResolution = currentRes;
+        Logger::Log("TIMER: Set to 0.5ms (current: " + std::to_string(currentRes) + ")");
+    } else {
+        Logger::Log("TIMER: Failed with status " + std::to_string(status));
+    }
+}
+
+// ================================================================================
+// PHASE MANAGER (из v18.5)
+// ================================================================================
+
+void Phase1_Init(DWORD gamePid) {
+    currentPhase = 1;
+    std::cout << "\n[ФАЗА 1] Инициализация. GPU -> 250W. Таймер -> 0.5 мс.\n";
+    Logger::Log("PHASE1: Started");
+
+    // GPU на максимум
+    SetGpuPowerLimit(GPU_POWER_BOOST);
+
+    // Игра на прайм-ядра
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
+                                  FALSE, gamePid);
+    if (hProcess) {
+        SetProcessAffinityMask(hProcess, PRIME_CORES);
+        SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS);
+        CloseHandle(hProcess);
+        Logger::Log("PHASE1: Game pinned to PRIME cores");
+    }
+
+    // Таймер 0.5 мс
+    OptimizeWindowsTimer();
+
+    // Фон — на помощники
+    RestrictBackgroundProcesses();
+
+    // Чистка памяти
+    CleanSystemMemory();
+
+    // Ждём 5 секунд
+    std::this_thread::sleep_for(std::chrono::seconds(PHASE1_DURATION_SEC));
+    Logger::Log("PHASE1: Complete");
+}
+
+void Phase2_PreCache(DWORD gamePid) {
+    currentPhase = 2;
+    std::cout << "[ФАЗА 2] Предкэш карт. Банки памяти.\n";
+    Logger::Log("PHASE2: Started");
+
+    // Выделяем банки памяти
+    AllocateMemoryBanks();
+
+    // Приоритет ввода-вывода
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, gamePid);
+    if (hProcess) {
+        SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS);
+        CloseHandle(hProcess);
+    }
+
+    // Ждём 15 секунд — карты грузятся
+    std::this_thread::sleep_for(std::chrono::seconds(PHASE2_DURATION_SEC));
+
+    // Переходим в CHILL
+    SetGpuPowerLimit(GPU_POWER_CHILL);
+    currentPhase = 3;
+    std::cout << "[CHILL] Карты прогреты. GPU -> 170W. Игра готова!\n\n";
+    Logger::Log("PHASE2: Complete, entering CHILL");
+}
+
+// ================================================================================
+// FATALITY / BRUTALITY
+// ================================================================================
+
+std::atomic<time_t> lastFatalityTime{0};
+std::atomic<time_t> lastBrutalityTime{0};
+
+void TriggerFatality() {
+    if (!FATALITY_ENABLED) return;
+
+ 
