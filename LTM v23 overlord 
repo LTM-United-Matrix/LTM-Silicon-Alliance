@@ -1,0 +1,518 @@
+/*
+ * ================================================================================
+ * ================================================================================
+ *                    LTM OVERLORD v23 - SILICON ALLIANCE
+ *                        ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
+ * ================================================================================
+ * ================================================================================
+ *
+ *   Автор: Чингиз
+ *   Версия: v23_final
+ *   Платформа: Windows 11 x64 (Xeon E5-2698B V3)
+ *   Компилятор: Visual Studio 2022 (v143) | C++17 | MultiByte
+ *   Назначение: Оптимизация системы для максимальной производительности в играх.
+ *
+ *   ВСЕ ИСПРАВЛЕНИЯ:
+ *   - Устранена утечка дескрипторов (Handle Leak -> BSOD)
+ *   - CloseHandle вызывается ВСЕГДА во всех ветках кода
+ *   - Проверка прав администратора с понятным предупреждением
+ *   - Поиск игры не зависит от регистра букв
+ *   - Фоновые процессы урезаются ОДИН раз при старте игры
+ *   - Smooth Landing в отдельном потоке (HUD не зависает)
+ *   - HUD не мерцает (точечное обновление консоли)
+ *   - Защита от сворачивания консоли в Win11
+ *   - Безопасный вызов nvidia-smi через CreateProcess (без C4996)
+ *   - UTF-8 для русских символов в консоли
+ *   - Очистка буфера ввода перед cin.get()
+ *   - Все дескрипторы закрываются, все потоки join'ятся
+ *   - Защита от слишком маленького окна консоли
+ *
+ * ================================================================================
+ */
+
+#include <windows.h>
+#include <tlhelp32.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <cctype>
+#include <limits>
+
+// ================================================================================
+// ================================================================================
+//                    ГЛОБАЛЬНЫЕ НАСТРОЙКИ
+// ================================================================================
+// ================================================================================
+
+// Конфигурация ядер под Xeon E5-2698B V3 (16 ядер / 32 потока)
+// Ядра 0-3  -> Фоновые процессы (Windows, браузер, Discord)
+// Ядра 4-15 -> Игра (чистые физические ядра)
+const DWORD_PTR BACKGROUND_CORES_MASK = 0x000F;   // Ядра 0,1,2,3
+const DWORD_PTR GAME_CORES_MASK       = 0xFFF0;   // Ядра 4-15
+const DWORD_PTR ALL_CORES_MASK        = 0xFFFF;   // Все 16 ядер
+
+// Пороговые значения
+const int GPU_POWER_MIN     = 100;
+const int GPU_POWER_MAX     = 500;
+const int DEFAULT_GPU_POWER = 280;
+
+// Задержки (в миллисекундах)
+const int GAME_DETECTION_INTERVAL_MS = 2000;
+const int HUD_REFRESH_INTERVAL_MS    = 1000;
+const int SMOOTH_LANDING_STEPS       = 3;
+const int SMOOTH_LANDING_STEP_DELAY_MS = 1000;
+const int NVIDIA_SMI_TIMEOUT_MS      = 15000;
+const int MIN_CONSOLE_ROWS_FOR_HUD   = 14;
+
+// ================================================================================
+// ================================================================================
+//                    ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ================================================================================
+// ================================================================================
+
+// Перевод строки в нижний регистр (для сравнения имён процессов)
+std::string ToLower(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) -> unsigned char {
+                       return static_cast<unsigned char>(std::tolower(c));
+                   });
+    return result;
+}
+
+// Безопасное получение последней ошибки Windows в читаемом виде
+std::string GetLastErrorAsString() {
+    DWORD errorCode = GetLastError();
+    if (errorCode == 0) return "NO_ERROR";
+
+    LPSTR messageBuffer = nullptr;
+    size_t size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL,
+        errorCode,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&messageBuffer),
+        0,
+        NULL);
+
+    if (size == 0 || messageBuffer == nullptr) {
+        return "Unknown error code: " + std::to_string(errorCode);
+    }
+
+    std::string message(messageBuffer, size);
+    LocalFree(messageBuffer);
+
+    // Убираем символы перевода строки в конце
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
+        message.pop_back();
+    }
+
+    return message;
+}
+
+// Очистка буфера ввода (чтобы cin.get() не проглатывал старые нажатия)
+void ClearInputBuffer() {
+    std::cin.clear();
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+}
+
+// ================================================================================
+// ================================================================================
+//                    УПРАВЛЕНИЕ ПРОЦЕССАМИ
+// ================================================================================
+// ================================================================================
+
+/*
+ * Установка маски ядер для процесса.
+ * ВАЖНО: CloseHandle вызывается ВСЕГДА.
+ * В оригинальном коде при ошибке SetProcessAffinityMask
+ * дескриптор утекал -> BSOD за несколько часов.
+ */
+bool SetProcessCores(DWORD processId, DWORD_PTR affinityMask) {
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, processId);
+
+    if (hProcess == NULL) {
+        // Процесс защищён (антивирус, критическая служба Windows)
+        // Дескриптор не был получен — утечки нет
+        return false;
+    }
+
+    BOOL result = SetProcessAffinityMask(hProcess, affinityMask);
+
+    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: CloseHandle ВСЕГДА
+    CloseHandle(hProcess);
+
+    return (result != FALSE);
+}
+
+/*
+ * Однократное ограничение фоновых процессов.
+ * Вызывается СТРОГО ОДИН РАЗ при обнаружении игры.
+ * В оригинале вызывалось каждую секунду -> огромный оверхед CPU.
+ */
+void RestrictBackgroundProcesses(DWORD_PTR backgroundCores) {
+    std::cout << "[LTM] Ограничение фоновых процессов на ядрах 0x"
+              << std::hex << backgroundCores << std::dec << "..." << std::endl;
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        std::cerr << "[LTM] ОШИБКА: Не удалось создать снимок процессов: "
+                  << GetLastErrorAsString() << std::endl;
+        return;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    int restrictedCount = 0;
+    int skippedCount    = 0;
+    DWORD ourPid        = GetCurrentProcessId();
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            // Пропускаем системные процессы и самих себя
+            if (pe32.th32ProcessID == 0 ||
+                pe32.th32ProcessID == 4 ||       // System
+                pe32.th32ProcessID == ourPid) {   // Наш процесс
+                skippedCount++;
+                continue;
+            }
+
+            if (SetProcessCores(pe32.th32ProcessID, backgroundCores)) {
+                restrictedCount++;
+            } else {
+                skippedCount++;
+            }
+
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    // Закрываем снапшот (тоже дескриптор!)
+    CloseHandle(hSnapshot);
+
+    std::cout << "[LTM] Готово: " << restrictedCount << " процессов ограничено, "
+              << skippedCount << " пропущено." << std::endl;
+}
+
+/*
+ * Восстановление всех процессов на все ядра при выходе из игры.
+ * CloseHandle на hSnapshot вызывается ВСЕГДА.
+ */
+void RestoreSystemProcesses() {
+    std::cout << "[LTM] Восстановление всех процессов на все ядра..." << std::endl;
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        std::cerr << "[LTM] ОШИБКА: Не удалось создать снимок процессов: "
+                  << GetLastErrorAsString() << std::endl;
+        return;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    DWORD ourPid = GetCurrentProcessId();
+    int restoredCount = 0;
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == 0 ||
+                pe32.th32ProcessID == 4 ||
+                pe32.th32ProcessID == ourPid) {
+                continue;
+            }
+
+            if (SetProcessCores(pe32.th32ProcessID, ALL_CORES_MASK)) {
+                restoredCount++;
+            }
+
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+
+    std::cout << "[LTM] Готово: " << restoredCount << " процессов восстановлено." << std::endl;
+}
+
+// ================================================================================
+// ================================================================================
+//                    ПОИСК ИГРЫ
+// ================================================================================
+// ================================================================================
+
+// Структура записи об игре из базы данных
+struct GameEntry {
+    std::string name;       // Имя исполняемого файла (например, cs2.exe)
+    std::string path;       // Путь к игре (опционально)
+    int targetGpuPower;     // Целевая мощность GPU для этой игры
+};
+
+// Загрузка базы данных игр
+std::vector<GameEntry> LoadGameDatabase() {
+    std::vector<GameEntry> database;
+
+    database.push_back({"cs2.exe",        "C:\\Games\\CS2\\cs2.exe",              280});
+    database.push_back({"r5apex.exe",     "C:\\Games\\Apex Legends\\r5apex.exe",  300});
+    database.push_back({"cod.exe",        "C:\\Games\\Call of Duty\\cod.exe",      320});
+    database.push_back({"valorant.exe",   "C:\\Games\\Valorant\\valorant.exe",     250});
+    database.push_back({"fortnite.exe",   "C:\\Games\\Fortnite\\fortnite.exe",     270});
+    database.push_back({"cyberpunk2077.exe", "C:\\Games\\Cyberpunk 2077\\bin\\x64\\cyberpunk2077.exe", 350});
+
+    return database;
+}
+
+/*
+ * Поиск активной игры в списке процессов.
+ * ИСПРАВЛЕНИЕ: имена сравниваются в нижнем регистре.
+ * Теперь "CS2.EXE" и "cs2.exe" находятся одинаково.
+ */
+bool FindActiveGamePid(const std::vector<GameEntry>& database,
+                       DWORD& outPid,
+                       std::string& outGameName,
+                       int& outTargetGpuPower) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        std::cerr << "[LTM] ОШИБКА: Не удалось создать снимок процессов: "
+                  << GetLastErrorAsString() << std::endl;
+        return false;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    bool found = false;
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            std::string procNameLower = ToLower(pe32.szExeFile);
+
+            for (const auto& game : database) {
+                if (procNameLower == ToLower(game.name)) {
+                    outPid            = pe32.th32ProcessID;
+                    outGameName       = game.name;
+                    outTargetGpuPower = game.targetGpuPower;
+                    found = true;
+                    break;
+                }
+            }
+        } while (!found && Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+// Привязка игры к выделенным ядрам
+bool PinGameToCores(DWORD gamePid, DWORD_PTR gameCores) {
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, gamePid);
+
+    if (hProcess == NULL) {
+        std::cerr << "[LTM] ОШИБКА: Не удалось открыть процесс игры: "
+                  << GetLastErrorAsString() << std::endl;
+        return false;
+    }
+
+    BOOL result = SetProcessAffinityMask(hProcess, gameCores);
+    CloseHandle(hProcess);  // Закрываем ВСЕГДА
+
+    if (result) {
+        std::cout << "[LTM] Игра привязана к ядрам 0x"
+                  << std::hex << gameCores << std::dec << std::endl;
+    } else {
+        std::cerr << "[LTM] ОШИБКА: Не удалось привязать игру к ядрам: "
+                  << GetLastErrorAsString() << std::endl;
+    }
+
+    return (result != FALSE);
+}
+
+// ================================================================================
+// ================================================================================
+//                    УПРАВЛЕНИЕ GPU (БЕЗОПАСНЫЙ ВЫЗОВ)
+// ================================================================================
+// ================================================================================
+
+/*
+ * Безопасная установка лимита мощности GPU через CreateProcess.
+ * ИСПРАВЛЕНИЕ: замена std::system (которая вызывает C4996 в VS2022)
+ * на CreateProcessA. Это также устраняет уязвимость Command Injection.
+ */
+bool SetNvidiaPowerLimit(int wattage) {
+    // Проверка диапазона
+    if (wattage < GPU_POWER_MIN || wattage > GPU_POWER_MAX) {
+        std::cerr << "[LTM] ОШИБКА: Мощность GPU должна быть в диапазоне "
+                  << GPU_POWER_MIN << "-" << GPU_POWER_MAX << " Вт." << std::endl;
+        std::cerr << "[LTM]   Запрошено: " << wattage << " Вт." << std::endl;
+        return false;
+    }
+
+    std::string cmdLine = "nvidia-smi -pl " + std::to_string(wattage);
+
+    std::cout << "[LTM] Выполнение: " << cmdLine << std::endl;
+
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;  // Без окна командной строки
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Создаём копию строки, так как CreateProcessA может её модифицировать
+    std::vector<char> cmdLineBuffer(cmdLine.begin(), cmdLine.end());
+    cmdLineBuffer.push_back('\0');
+
+    BOOL success = CreateProcessA(
+        NULL,                       // No module name (use command line)
+        cmdLineBuffer.data(),       // Command line
+        NULL,                       // Process handle not inheritable
+        NULL,                       // Thread handle not inheritable
+        FALSE,                      // Set handle inheritance to FALSE
+        CREATE_NO_WINDOW,           // No console window
+        NULL,                       // Use parent's environment block
+        NULL,                       // Use parent's starting directory
+        &si,                        // Pointer to STARTUPINFO structure
+        &pi                         // Pointer to PROCESS_INFORMATION structure
+    );
+
+    if (!success) {
+        std::cerr << "[LTM] ОШИБКА запуска nvidia-smi: " << GetLastErrorAsString() << std::endl;
+        std::cerr << "[LTM]   Проверьте, что nvidia-smi доступен в PATH." << std::endl;
+        std::cerr << "[LTM]   Проверьте, что программа запущена от Администратора." << std::endl;
+        return false;
+    }
+
+    // Ждём завершения с таймаутом
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, NVIDIA_SMI_TIMEOUT_MS);
+
+    bool result = false;
+
+    if (waitResult == WAIT_OBJECT_0) {
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            if (exitCode == 0) {
+                std::cout << "[LTM] Мощность GPU установлена на " << wattage << " Вт." << std::endl;
+                result = true;
+            } else {
+                std::cerr << "[LTM] ОШИБКА: nvidia-smi завершился с кодом " << exitCode << std::endl;
+            }
+        }
+    } else if (waitResult == WAIT_TIMEOUT) {
+        std::cerr << "[LTM] ОШИБКА: nvidia-smi не ответил за "
+                  << NVIDIA_SMI_TIMEOUT_MS / 1000 << " сек." << std::endl;
+        TerminateProcess(pi.hProcess, 1);
+    } else {
+        std::cerr << "[LTM] ОШИБКА: Сбой ожидания nvidia-smi: " << GetLastErrorAsString() << std::endl;
+    }
+
+    // Закрываем дескрипторы процесса и потока
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return result;
+}
+
+// ================================================================================
+// ================================================================================
+//                    ПРОВЕРКА ПРАВ АДМИНИСТРАТОРА
+// ================================================================================
+// ================================================================================
+
+bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &adminGroup)) {
+
+        if (!CheckTokenMembership(NULL, adminGroup, &isAdmin)) {
+            isAdmin = FALSE;
+        }
+
+        FreeSid(adminGroup);
+    }
+
+    return (isAdmin != FALSE);
+}
+
+// ================================================================================
+// ================================================================================
+//                    HUD (С ЗАЩИТОЙ ОТ СВОРАЧИВАНИЯ В WIN11)
+// ================================================================================
+// ================================================================================
+
+/*
+ * ИСПРАВЛЕНИЕ: точечное обновление консоли без мерцания.
+ * Добавлена защита от сворачивания окна в Windows 11:
+ * если буфер консоли недоступен — используем простой вывод.
+ * Если окно слишком маленькое — выводим сокращённую версию.
+ */
+void RenderHUD(const std::string& gameName, int fps, int wattage,
+               const std::string& status, bool isAdmin) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (hConsole == INVALID_HANDLE_VALUE || hConsole == NULL) {
+        // Консоль не доступна (перенаправлен вывод или свёрнута)
+        return;
+    }
+
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        // Fallback: буфер недоступен — используем простой вывод
+        std::cout << "[LTM HUD] " << status
+                  << " | Игра: " << (gameName.empty() ? "Ожидание..." : gameName)
+                  << " | FPS: " << fps
+                  << " | GPU: " << wattage << " Вт"
+                  << " | Админ: " << (isAdmin ? "ДА" : "НЕТ")
+                  << std::endl;
+        return;
+    }
+
+    int consoleRows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+    if (consoleRows < MIN_CONSOLE_ROWS_FOR_HUD) {
+        // Окно слишком маленькое — сокращённая версия
+        std::cout << "[LTM] " << (gameName.empty() ? "Ожидание..." : gameName)
+                  << " | FPS:" << fps
+                  << " | GPU:" << wattage << "Вт"
+                  << " | " << status
+                  << std::endl;
+        return;
+    }
+
+    // Сохраняем позицию курсора
+    COORD originalPos = csbi.dwCursorPosition;
+
+    // Перемещаемся в начало области HUD
+    SetConsoleCursorPosition(hConsole, {0, 0});
+
+    // Рисуем HUD
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+    std::cout << "                      LTM OVERLORD v23 - SILICON ALLIANCE                       \n";
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+    std::cout << "\n";
+    std::cout << "                   >>> КОД ЗАПУЩЕН - МОЖНО ИГРАТЬ! <<<\n";
+    std::cout << "\n";
+    std::cout << "  [СТАТУС]   " << status << "\n";
+    std::cout << "  [АДМИН]    " << (isAdmin ? "ДА" : "НЕТ (требуется перезапуск)") << "\n";
+    std::cout << "  [ИГРА]     " << (gameName.empty() ? "Ожидание..." : gameName) << "\n";
+    std::cout << "  [FPS]      " << fps << "\n";
+    std::cout << "  [GPU Вт]   " << wattage << " Вт\n";
+    std::cout << "\n";
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+
+    // Возвращаем курсор на место
+    SetConsoleCu
