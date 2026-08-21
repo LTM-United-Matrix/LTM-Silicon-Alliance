@@ -1,0 +1,598 @@
+/*
+ * ================================================================================
+ * ================================================================================
+ *     LTM v25 OVERLORD — ФИНАЛЬНАЯ ВЕРСИЯ
+ * ================================================================================
+ * ================================================================================
+ *
+ *   Версия: v25
+ *   Платформа: Windows 11 x64
+ *   Язык: C++17
+ *   Компилятор: Visual Studio 2022 (v143)
+ *
+ *   ВСЕ ЛУЧШИЕ НАРАБОТКИ:
+ *   - Таймер 1.0 мс (безопасен для беспроводной мыши)
+ *   - Динамическая матрица ядер (любое железо)
+ *   - Две фазы загрузки (v18.5)
+ *   - Fatality/Brutality (только работа GPU, с кулдаунами)
+ *   - HUD без мерцания
+ *   - Логгер
+ *   - Без плацебо и опасных функций
+ *
+ * ================================================================================
+ */
+
+#define NOMINMAX  // Отключаем конфликт с std::numeric_limits::max()
+
+#include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <chrono>
+#include <cctype>
+#include <limits>
+#include <ctime>
+
+#pragma comment(lib, "psapi.lib")
+
+// ================================================================================
+// КОНФИГУРАЦИЯ
+// ================================================================================
+
+struct Config {
+    int timerResolution100ns = 10000;  // 1.0 мс
+    bool timerEnabled = true;
+
+    int gpuPowerChill = 170;
+    int gpuPowerBoost = 250;
+    int gpuPowerFatality = 120;
+
+    int phase1DurationSec = 5;
+    int phase2DurationSec = 15;
+
+    bool fatalityEnabled = true;
+    bool brutalityEnabled = true;
+    int fatalityCooldownSec = 30;
+
+    bool schoolMode = false;
+
+    int hudRefreshMs = 1000;
+    int gameDetectionSec = 2;
+};
+
+Config g_config;
+std::mutex g_configMutex;
+
+// ================================================================================
+// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+// ================================================================================
+
+std::atomic<bool> g_gameRunning{false};
+std::atomic<bool> g_fatalityActive{false};
+std::atomic<bool> g_brutalityActive{false};
+std::atomic<int> g_currentPhase{0};
+std::atomic<int> g_currentGpuPower{250};
+std::atomic<time_t> g_lastFatalityTime{0};
+
+std::mutex g_gameInfoMutex;
+std::string g_activeGameName;
+DWORD g_activeGamePid = 0;
+
+bool g_isAdmin = false;
+ULONG g_timerResolutionSaved = 0;
+bool g_timerWasSet = false;
+
+// ================================================================================
+// ЛОГГЕР
+// ================================================================================
+
+class Logger {
+private:
+    static std::mutex s_mutex;
+public:
+    static void Init() {
+        std::ofstream file("ltm_v25.log", std::ios::trunc);
+        if (file.is_open()) {
+            file << "============================================\n";
+            file << "  LTM v25 OVERLORD — LOG\n";
+            file << "============================================\n\n";
+        }
+    }
+
+    static void Log(const std::string& msg) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        std::ofstream file("ltm_v25.log", std::ios::app);
+        if (file.is_open()) {
+            time_t now = time(nullptr);
+            char timeStr[32];
+            ctime_s(timeStr, sizeof(timeStr), &now);
+            timeStr[24] = '\0';
+            file << "[" << timeStr << "] " << msg << "\n";
+        }
+    }
+};
+std::mutex Logger::s_mutex;
+
+// ================================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ================================================================================
+
+std::string ToLower(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) -> unsigned char {
+                       return static_cast<unsigned char>(std::tolower(c));
+                   });
+    return result;
+}
+
+std::string WcharToString(const WCHAR* wstr) {
+    std::wstring ws(wstr);
+    return std::string(ws.begin(), ws.end());
+}
+
+std::string GetLastErrorString() {
+    DWORD code = GetLastError();
+    if (code == 0) return "NO_ERROR";
+    LPSTR buf = nullptr;
+    size_t size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+        NULL, code, 0, (LPSTR)&buf, 0, NULL);
+    if (size == 0) return "Error: " + std::to_string(code);
+    std::string msg(buf, size);
+    LocalFree(buf);
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+    return msg;
+}
+
+void ClearInputBuffer() {
+    std::cin.clear();
+    std::cin.ignore((std::numeric_limits<std::streamsize>::max)(), '\n');
+}
+
+// ================================================================================
+// ПРОВЕРКА АДМИНИСТРАТОРА
+// ================================================================================
+
+bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &adminGroup)) {
+
+        if (!CheckTokenMembership(NULL, adminGroup, &isAdmin)) {
+            isAdmin = FALSE;
+        }
+        FreeSid(adminGroup);
+    }
+
+    return (isAdmin != FALSE);
+}
+
+// ================================================================================
+// АВТООПРЕДЕЛЕНИЕ CPU
+// ================================================================================
+
+struct CpuInfo {
+    int logicalProcessors = 0;
+    int physicalCores = 0;
+    std::string model;
+};
+
+CpuInfo DetectCpu() {
+    CpuInfo info;
+
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    info.logicalProcessors = static_cast<int>(sysInfo.dwNumberOfProcessors);
+
+    // Физические ядра
+    DWORD bufferSize = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bufferSize);
+    if (bufferSize > 0) {
+        std::vector<BYTE> buffer(bufferSize);
+        auto* base = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore, base, &bufferSize)) {
+            DWORD offset = 0;
+            while (offset < bufferSize) {
+                info.physicalCores++;
+                auto* entry = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+                    buffer.data() + offset);
+                offset += entry->Size;
+            }
+        }
+    }
+
+    if (info.physicalCores == 0) {
+        info.physicalCores = info.logicalProcessors;
+    }
+
+    // Модель CPU
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        char model[256] = {0};
+        DWORD size = sizeof(model);
+        if (RegQueryValueExA(hKey, "ProcessorNameString", NULL, NULL,
+            reinterpret_cast<LPBYTE>(model), &size) == ERROR_SUCCESS) {
+            info.model = model;
+        }
+        RegCloseKey(hKey);
+    }
+
+    Logger::Log("CPU: " + info.model + " | " +
+                std::to_string(info.physicalCores) + "C/" +
+                std::to_string(info.logicalProcessors) + "T");
+
+    return info;
+}
+
+// ================================================================================
+// ДИНАМИЧЕСКАЯ МАТРИЦА ЯДЕР
+// ================================================================================
+
+struct CoreMatrix {
+    DWORD_PTR primeMask = 0;
+    DWORD_PTR helperMask = 0;
+    DWORD_PTR spareMask = 0;
+};
+
+std::string MaskToString(DWORD_PTR mask) {
+    std::stringstream ss;
+    ss << "0x" << std::hex << mask;
+    return ss.str();
+}
+
+CoreMatrix BuildCoreMatrix(const CpuInfo& cpu) {
+    CoreMatrix matrix;
+    int total = cpu.logicalProcessors;
+
+    if (total >= 28) {
+        matrix.primeMask  = 0x0000000F;  // 0-3
+        matrix.helperMask = 0x00FFFFF0;  // 4-23
+        matrix.spareMask  = 0x0F000000;  // 24-27
+    } else if (total >= 24) {
+        matrix.primeMask  = 0x0000003F;  // 0-5
+        matrix.helperMask = 0x00FFFFC0;  // 6-23
+        matrix.spareMask  = 0x00000000;
+    } else if (total >= 16) {
+        matrix.primeMask  = 0x000000FF;  // 0-7
+        matrix.helperMask = 0x0000FF00;  // 8-15
+        matrix.spareMask  = 0x00000000;
+    } else if (total >= 8) {
+        matrix.primeMask  = 0x0000000F;  // 0-3
+        matrix.helperMask = 0x000000F0;  // 4-7
+        matrix.spareMask  = 0x00000000;
+    } else {
+        matrix.primeMask  = (total >= 64) ? ~0ULL : ((1ULL << total) - 1);
+        matrix.helperMask = 0;
+        matrix.spareMask  = 0;
+    }
+
+    Logger::Log("Matrix: Prime=" + MaskToString(matrix.primeMask) +
+                " Helper=" + MaskToString(matrix.helperMask) +
+                " Spare=" + MaskToString(matrix.spareMask));
+
+    return matrix;
+}
+
+// ================================================================================
+// УПРАВЛЕНИЕ ПРОЦЕССАМИ
+// ================================================================================
+
+bool SetProcessAffinity(DWORD pid, DWORD_PTR mask) {
+    HANDLE h = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    BOOL result = SetProcessAffinityMask(h, mask);
+    CloseHandle(h);
+    return result != FALSE;
+}
+
+// ================================================================================
+// GPU (безопасный вызов)
+// ================================================================================
+
+bool SetGpuPower(int wattage) {
+    if (wattage < 100 || wattage > 500) {
+        Logger::Log("GPU: Invalid wattage " + std::to_string(wattage));
+        return false;
+    }
+
+    std::wstring fullCmd = std::wstring(L"nvidia-smi -pl ") + std::to_wstring(wattage);
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (CreateProcessW(NULL, const_cast<LPWSTR>(fullCmd.c_str()),
+                       NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 15000);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        if (exitCode == 0) {
+            g_currentGpuPower = wattage;
+            Logger::Log("GPU: Power set to " + std::to_string(wattage) + "W");
+            return true;
+        }
+    }
+
+    Logger::Log("GPU: Failed to set power");
+    return false;
+}
+
+// ================================================================================
+// ТАЙМЕР
+// ================================================================================
+
+bool SetTimerResolution() {
+    if (!g_config.timerEnabled) return false;
+
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return false;
+
+    typedef LONG(WINAPI* NtSetTimerResolutionPtr)(ULONG, BOOLEAN, PULONG);
+    auto func = (NtSetTimerResolutionPtr)GetProcAddress(ntdll, "NtSetTimerResolution");
+    if (!func) return false;
+
+    ULONG currentRes = 0;
+    LONG status = func(g_config.timerResolution100ns, TRUE, &currentRes);
+
+    if (status == 0) {
+        g_timerResolutionSaved = currentRes;
+        g_timerWasSet = true;
+        Logger::Log("Timer: Set to 1.0 ms");
+        return true;
+    }
+
+    return false;
+}
+
+void ResetTimer() {
+    if (!g_timerWasSet) return;
+
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return;
+
+    typedef LONG(WINAPI* NtSetTimerResolutionPtr)(ULONG, BOOLEAN, PULONG);
+    auto func = (NtSetTimerResolutionPtr)GetProcAddress(ntdll, "NtSetTimerResolution");
+    if (!func) return;
+
+    ULONG currentRes = 0;
+    func(g_timerResolutionSaved, TRUE, &currentRes);
+    g_timerWasSet = false;
+    Logger::Log("Timer: Reset");
+}
+
+// ================================================================================
+// ПОИСК ИГРЫ
+// ================================================================================
+
+const std::vector<std::string> GAME_LIST = {
+    "cs2.exe", "r5apex.exe", "cod.exe", "valorant.exe",
+    "fortnite.exe", "cyberpunk2077.exe", "roblox.exe"
+};
+
+bool FindGame(DWORD& outPid, std::string& outName) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(snapshot, &pe)) {
+        do {
+            std::string name = ToLower(WcharToString(pe.szExeFile));
+            for (const auto& game : GAME_LIST) {
+                if (name == ToLower(game)) {
+                    outPid = pe.th32ProcessID;
+                    outName = WcharToString(pe.szExeFile);
+                    CloseHandle(snapshot);
+                    return true;
+                }
+            }
+        } while (Process32Next(snapshot, &pe));
+    }
+
+    CloseHandle(snapshot);
+    return false;
+}
+
+// ================================================================================
+// ФАЗЫ
+// ================================================================================
+
+void Phase1_Init(DWORD pid, const CoreMatrix& matrix) {
+    g_currentPhase = 1;
+    Logger::Log("Phase1: Started");
+
+    SetGpuPower(g_config.gpuPowerBoost);
+    SetTimerResolution();
+
+    HANDLE h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (h) {
+        SetProcessAffinityMask(h, matrix.primeMask);
+        SetPriorityClass(h, HIGH_PRIORITY_CLASS);
+        CloseHandle(h);
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(g_config.phase1DurationSec));
+    Logger::Log("Phase1: Complete");
+}
+
+void Phase2_Stabilize(DWORD pid) {
+    g_currentPhase = 2;
+    Logger::Log("Phase2: Started");
+
+    std::this_thread::sleep_for(std::chrono::seconds(g_config.phase2DurationSec));
+
+    SetGpuPower(g_config.gpuPowerChill);
+    g_currentPhase = 3;
+    Logger::Log("Phase2: Complete, CHILL mode");
+}
+
+// ================================================================================
+// FATALITY / BRUTALITY
+// ================================================================================
+
+void TriggerFatality() {
+    if (!g_config.fatalityEnabled) return;
+
+    time_t now = time(nullptr);
+    if (now - g_lastFatalityTime < g_config.fatalityCooldownSec) return;
+
+    g_lastFatalityTime = now;
+    g_fatalityActive = true;
+    g_brutalityActive = false;
+
+    SetGpuPower(g_config.gpuPowerFatality);
+    Logger::Log("Fatality: GPU -> " + std::to_string(g_config.gpuPowerFatality) + "W");
+
+    std::thread recovery([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (g_gameRunning && g_fatalityActive) {
+            g_fatalityActive = false;
+            SetGpuPower(g_config.gpuPowerChill);
+            Logger::Log("Fatality: Recovery -> CHILL");
+        }
+    });
+    recovery.detach();
+}
+
+void TriggerBrutality() {
+    if (!g_config.brutalityEnabled) return;
+
+    g_brutalityActive = true;
+    g_fatalityActive = false;
+
+    SetGpuPower(g_config.gpuPowerBoost);
+    Logger::Log("Brutality: GPU -> " + std::to_string(g_config.gpuPowerBoost) + "W");
+
+    std::thread recovery([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (g_gameRunning && g_brutalityActive) {
+            g_brutalityActive = false;
+            SetGpuPower(g_config.gpuPowerChill);
+            Logger::Log("Brutality: Recovery -> CHILL");
+        }
+    });
+    recovery.detach();
+}
+
+// ================================================================================
+// HUD
+// ================================================================================
+
+void RenderHUD(const std::string& status, const CpuInfo& cpu, const CoreMatrix& matrix) {
+    if (g_config.schoolMode) {
+        static int counter = 0;
+        if (counter++ % 10 == 0) {
+            std::cout << "[LTM] " << status << " | GPU: " << g_currentGpuPower << "W\n";
+        }
+        return;
+    }
+
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!hConsole || hConsole == INVALID_HANDLE_VALUE) return;
+
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        std::cout << "[LTM] " << status << " | GPU: " << g_currentGpuPower
+                  << "W | " << g_activeGameName << "\n";
+        return;
+    }
+
+    int rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    if (rows < 14) {
+        std::cout << "[LTM] " << g_activeGameName << " | GPU:" << g_currentGpuPower
+                  << "W | " << status << "\n";
+        return;
+    }
+
+    COORD original = csbi.dwCursorPosition;
+    SetConsoleCursorPosition(hConsole, {0, 0});
+
+    std::string fatality = g_fatalityActive ? "*** FATALITY ***" : "---";
+    std::string brutality = g_brutalityActive ? "*** BRUTALITY ***" : "---";
+    std::string phase;
+    switch (g_currentPhase.load()) {
+        case 1: phase = "ФАЗА 1: Загрузка"; break;
+        case 2: phase = "ФАЗА 2: Стабилизация"; break;
+        case 3: phase = "Активна"; break;
+        default: phase = "Ожидание"; break;
+    }
+
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+    std::cout << "                 LTM v25 OVERLORD — FINAL                                       \n";
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+    std::cout << "\n";
+    std::cout << "  >>> КОД ЗАПУЩЕН - МОЖНО ИГРАТЬ! <<<\n";
+    std::cout << "\n";
+    std::cout << "  [СТАТУС]    " << status << "\n";
+    std::cout << "  [ФАЗА]      " << phase << "\n";
+    std::cout << "  [ИГРА]      " << (g_activeGameName.empty() ? "Ожидание..." : g_activeGameName) << "\n";
+    std::cout << "  [GPU]       " << g_currentGpuPower << " Вт\n";
+    std::cout << "  [FATALITY]  " << fatality << "\n";
+    std::cout << "  [BRUTALITY] " << brutality << "\n";
+    std::cout << "  [CPU]       " << cpu.model << "\n";
+    std::cout << "  [ПОТОКОВ]   " << cpu.logicalProcessors << "\n";
+    std::cout << "\n";
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+
+    SetConsoleCursorPosition(hConsole, original);
+}
+
+// ================================================================================
+// MAIN
+// ================================================================================
+
+int main() {
+    srand(static_cast<unsigned>(time(nullptr)));
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
+    Logger::Init();
+    Logger::Log("LTM v25 OVERLORD — Starting");
+
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n";
+    std::cout << "            LTM v25 OVERLORD — ЗАПУСК                                           \n";
+    std::cout << "================================================================================\n";
+    std::cout << "================================================================================\n\n";
+
+    g_isAdmin = IsRunningAsAdmin();
+    Logger::Log("Admin: " + std::string(g_isAdmin ? "YES" : "NO"));
+
+    if (!g_isAdmin) {
+        std::cout << "  [!] Требуются права Администратора!\n";
+        std::cout << "  Нажмите ENTER для продолжения...\n";
+        ClearInputBuffer();
+        std::cin.get();
+    }
+
+    CpuInfo cpu = DetectCpu();
+    CoreMatrix matrix = BuildCor
