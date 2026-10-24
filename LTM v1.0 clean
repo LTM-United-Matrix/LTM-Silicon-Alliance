@@ -1,0 +1,275 @@
+/*
+ * LTM Clean v1.0 — только то, что реально работает
+ *
+ * Что делает:
+ *   1. powercfg High Performance (реальный эффект на Xeon с C-states)
+ *   2. nvidia-smi -pl — реальный лимит с валидацией по min/max карты
+ *   3. HUD с живыми данными GPU (temp, util, curW)
+ *   4. Хоткеи для переключения лимита и плана питания
+ *
+ * Что убрано (плацебо прошлых версий):
+ *   - Маски ядер (роняют FPS на 16+ потоках)
+ *   - HIGH_PRIORITY_CLASS (голодание audio/input)
+ *   - NtSetTimerResolution (уже высокое на Win10 2004+)
+ *   - EmptyWorkingSet по всем процессам (микрофризы)
+ *   - Банки памяти / предкэш карт (cargo cult)
+ *   - Fatality 120W (это троттлинг, а не буст)
+ */
+
+#include <windows.h>
+#include <tlhelp32.h>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <mutex>
+#include <algorithm>
+
+// ================================ CONFIG ================================
+
+static const char* LOG_FILE = "ltm_clean.log";
+static const char* GAME_LIST[] = {
+    "cs2.exe", "r5apex.exe", "cod.exe", "valorant.exe",
+    "fortnite.exe", "cyberpunk2077.exe"
+};
+static const int GAME_COUNT = 6;
+
+// ================================ LOG ===================================
+
+std::mutex g_logMtx;
+void Log(const std::string& s) {
+    std::lock_guard<std::mutex> l(g_logMtx);
+    std::ofstream f(LOG_FILE, std::ios::app);
+    if (!f) return;
+    time_t t = time(nullptr); char b[32];
+    ctime_s(b, sizeof(b), &t); b[24] = 0;
+    f << "[" << b << "] " << s << "\n";
+}
+
+// ================================ HELPERS ===============================
+
+std::string Lower(std::string s) {
+    for (auto& c : s) c = (char)::tolower((unsigned char)c);
+    return s;
+}
+
+struct CmdResult { std::string out; DWORD code = 1; };
+
+CmdResult RunCmd(const std::string& cmd) {
+    CmdResult res;
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE r = nullptr, w = nullptr;
+    if (!CreatePipe(&r, &w, &sa, 0)) return res;
+
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = si.hStdError = w;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<char> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(r); CloseHandle(w); return res;
+    }
+    CloseHandle(w);
+    WaitForSingleObject(pi.hProcess, 10000);
+    GetExitCodeProcess(pi.hProcess, &res.code);
+
+    char tmp[512]; DWORD n;
+    while (ReadFile(r, tmp, sizeof(tmp) - 1, &n, nullptr) && n > 0) {
+        tmp[n] = 0; res.out += tmp;
+    }
+    CloseHandle(r); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return res;
+}
+
+// ================================ GPU ===================================
+
+struct Gpu {
+    bool ok = false;
+    std::string name, err;
+    int minW = 0, maxW = 0, defW = 0, curW = 0, temp = 0, util = 0;
+};
+
+Gpu QueryGpu() {
+    Gpu g;
+    auto r = RunCmd("nvidia-smi --query-gpu=name,power.min_limit,power.max_limit,"
+                    "power.default_limit,power.limit,temperature.gpu,utilization.gpu "
+                    "--format=csv,noheader,nounits");
+    if (r.code != 0 || r.out.empty()) {
+        g.err = "nvidia-smi недоступен";
+        return g;
+    }
+    std::string line; std::getline(std::stringstream(r.out), line);
+    std::vector<std::string> p; std::stringstream ls(line); std::string s;
+    while (std::getline(ls, s, ',')) {
+        while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        p.push_back(s);
+    }
+    if (p.size() < 7) { g.err = "формат nvidia-smi неверный"; return g; }
+    try {
+        g.name = p[0];
+        g.minW = std::stoi(p[1]); g.maxW = std::stoi(p[2]);
+        g.defW = std::stoi(p[3]); g.curW = std::stoi(p[4]);
+        g.temp = std::stoi(p[5]); g.util = std::stoi(p[6]);
+        g.ok = true;
+    } catch (...) { g.err = "parse error"; }
+    return g;
+}
+
+bool SetGpuPower(int w) {
+    auto r = RunCmd("nvidia-smi -pl " + std::to_string(w));
+    bool ok = (r.code == 0);
+    Log("GPU: -pl " + std::to_string(w) + " -> " + (ok ? "OK" : "FAIL: " + r.out));
+    return ok;
+}
+
+void SetPowerPlan(const std::string& scheme) {
+    auto r = RunCmd("powercfg /setactive " + scheme);
+    Log("PowerPlan: " + scheme + " -> " + (r.code == 0 ? "OK" : "FAIL"));
+}
+
+// ================================ GAME DETECT ===========================
+
+DWORD FindGame(std::string& name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 pe{ sizeof(pe) };
+    DWORD pid = 0;
+    if (Process32First(snap, &pe)) do {
+        std::string n = Lower(pe.szExeFile);
+        for (int i = 0; i < GAME_COUNT; i++) {
+            if (n == GAME_LIST[i]) {
+                name = pe.szExeFile; pid = pe.th32ProcessID; break;
+            }
+        }
+        if (pid) break;
+    } while (Process32Next(snap, &pe));
+    CloseHandle(snap);
+    return pid;
+}
+
+// ================================ HUD ===================================
+
+void RenderHud(const Gpu& g, const std::string& game, bool gameOn, bool highPlan) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!h || h == INVALID_HANDLE_VALUE || !GetConsoleScreenBufferInfo(h, &csbi)) return;
+
+    if (csbi.srWindow.Bottom - csbi.srWindow.Top < 10) {
+        std::cout << "[LTM] " << (gameOn ? game : "ожидание") << " | "
+                  << g.curW << "W | " << g.temp << "C | " << g.util << "%\n";
+        return;
+    }
+    COORD orig = csbi.dwCursorPosition;
+    SetConsoleCursorPosition(h, { 0, 0 });
+
+    std::cout << "==============================================================\n";
+    std::cout << "  LTM Clean v1.0 — без плацебо\n";
+    std::cout << "==============================================================\n\n";
+    if (!g.ok) {
+        std::cout << "  [GPU]   ОШИБКА: " << g.err << "\n";
+    } else {
+        std::cout << "  [GPU]   " << g.name << "\n";
+        std::cout << "  [ЛИМИТ] " << g.curW << " Вт из [" << g.minW << ".." << g.maxW
+                  << "] (по умолчанию " << g.defW << ")\n";
+        std::cout << "  [СТАТ]  " << g.temp << "\xC2\xB0" << "C | " << g.util << "%\n";
+    }
+    std::cout << "  [ИГРА]  " << (gameOn ? game : "не запущена") << "\n";
+    std::cout << "  [ПЛАН]  " << (highPlan ? "High Performance" : "Balanced") << "\n\n";
+    std::cout << "  [F1] лимит по умолчанию   [F2] -20W   [F3] +20W\n";
+    std::cout << "  [F4] план питания         [ESC] выход\n";
+    std::cout << "==============================================================\n";
+
+    SetConsoleCursorPosition(h, orig);
+}
+
+// ================================ MAIN =================================
+
+int main() {
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    Log("=== LTM Clean v1.0 start ===");
+
+    Gpu g = QueryGpu();
+    if (!g.ok) {
+        std::cout << "  [!] " << g.err << "\n";
+        std::cout << "  Без nvidia-smi управление лимитом невозможно.\n";
+        std::cout << "  ENTER — продолжить только с HUD, ESC — выход.\n";
+        while (!(GetAsyncKeyState(VK_RETURN) & 0x8000) &&
+               !(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) Sleep(50);
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) return 0;
+    } else {
+        Log("GPU: " + g.name + " | limit " + std::to_string(g.curW) +
+            "W of [" + std::to_string(g.minW) + ".." + std::to_string(g.maxW) + "]");
+    }
+
+    SetPowerPlan("SCHEME_MIN");
+    std::atomic<bool> running{ true };
+    std::atomic<int> targetW{ g.ok ? g.curW : 0 };
+    std::atomic<bool> highPlan{ true };
+    std::string gameName;
+    bool gameOn = false;
+
+    std::thread hud([&]() {
+        bool pF1 = false, pF2 = false, pF3 = false, pF4 = false;
+        auto lastUpdate = std::chrono::steady_clock::now();
+
+        while (running) {
+            bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+            bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+            bool f3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+            bool f4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+
+            if (g.ok) {
+                bool changed = false;
+                if (f1 && !pF1) { targetW = g.defW; changed = true; }
+                if (f2 && !pF2) { targetW = std::max(g.minW, targetW.load() - 20); changed = true; }
+                if (f3 && !pF3) { targetW = std::min(g.maxW, targetW.load() + 20); changed = true; }
+                if (changed) SetGpuPower(targetW.load());
+            }
+            if (f4 && !pF4) {
+                highPlan = !highPlan;
+                SetPowerPlan(highPlan ? "SCHEME_MIN" : "SCHEME_BALANCED");
+            }
+            pF1 = f1; pF2 = f2; pF3 = f3; pF4 = f4;
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastUpdate > std::chrono::milliseconds(1000)) {
+                Gpu fresh = QueryGpu();
+                if (fresh.ok) g = fresh;
+
+                std::string gn;
+                DWORD pid = FindGame(gn);
+                if (pid && !gameOn) {
+                    gameName = gn; gameOn = true; Log("Game detected: " + gn);
+                } else if (!pid && gameOn) {
+                    gameName.clear(); gameOn = false; Log("Game exited");
+                }
+                lastUpdate = now;
+            }
+
+            RenderHud(g, gameName, gameOn, highPlan.load());
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
+    while (running) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) running = false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    hud.join();
+
+    SetPowerPlan("SCHEME_BALANCED");
+    Log("=== shutdown ===");
+    std::cout << "\n  Завершено. Лог: " << LOG_FILE << "\n";
+    return 0;
+}
